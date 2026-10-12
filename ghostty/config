@@ -1,0 +1,21 @@
+# Laptop-side Ghostty config (the font and terminal palette live on the client,
+# not the devbox). Link it on the laptop:
+#   ln -sfn ~/path/to/dotfiles/ghostty/config ~/.config/ghostty/config
+# Requires the Monaspace fonts installed locally (macOS: brew install --cask font-monaspace).
+
+theme = Gruvbox Material Dark
+
+font-family = Monaspace Neon
+font-size = 14
+# Monaspace's texture healing is the `calt` feature, on by default. Its
+# code ligatures are opt-in stylistic sets; remove any you dislike.
+font-feature = calt
+font-feature = liga
+font-feature = ss01
+font-feature = ss02
+font-feature = ss03
+font-feature = ss04
+font-feature = ss05
+font-feature = ss06
+font-feature = ss07
+font-feature = ss08

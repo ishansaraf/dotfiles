@@ -1,6 +1,7 @@
 export PATH="$HOME/.local/bin:$PATH"
 export EDITOR=hx VISUAL=hx
 export PAGER=less LESS=-FRX
+# ansi makes bat and delta use the terminal's 16-color palette, i.e. Gruvbox Material.
 export BAT_THEME=ansi
 
 HISTFILE=~/.zsh_history
@@ -36,7 +37,9 @@ bindkey '^[[1;5D' backward-word
 export FZF_DEFAULT_COMMAND='fd --type f --hidden --exclude .git'
 export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
 export FZF_ALT_C_COMMAND='fd --type d --hidden --exclude .git'
-export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border'
+export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border
+  --color=bg+:#3c3836,bg:-1,fg:#d4be98,fg+:#ddc7a1,hl:#d8a657,hl+:#d8a657
+  --color=border:#5a524c,header:#7daea3,info:#89b482,marker:#a9b665,pointer:#e78a4e,prompt:#a9b665,spinner:#89b482'
 [[ -f /usr/share/doc/fzf/examples/key-bindings.zsh ]] && source /usr/share/doc/fzf/examples/key-bindings.zsh
 [[ -f /usr/share/doc/fzf/examples/completion.zsh ]] && source /usr/share/doc/fzf/examples/completion.zsh
 

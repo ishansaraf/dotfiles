@@ -9,6 +9,15 @@
 [delta]
 	navigate = true
 	line-numbers = true
+	dark = true
+	# Gruvbox Material diff backgrounds.
+	minus-style = syntax "#3c1f1e"
+	minus-emph-style = syntax "#5c2a28"
+	plus-style = syntax "#34381b"
+	plus-emph-style = syntax "#4a5223"
+	line-numbers-minus-style = "#ea6962"
+	line-numbers-plus-style = "#a9b665"
+	line-numbers-zero-style = "#7c6f64"
 [init]
 	defaultBranch = main
 [diff]
