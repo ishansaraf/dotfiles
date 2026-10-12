@@ -9,7 +9,19 @@ set -euo pipefail
 DOTFILES="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 HELIX_VERSION=25.07.1
 STARSHIP_VERSION=1.26.0
+# Node for the npm-distributed language servers; kept off PATH so it never
+# shadows the repo's hermetic node. typescript-language-server 6 needs >=22.22.2.
+NODE_VERSION=22.23.2
+RUST_ANALYZER_VERSION=2026-09-21
+# pyright and biome match the versions dirt's CI uses (pyproject.toml, pnpm-lock.yaml).
+LSP_NPM_PACKAGES=(
+  pyright@1.1.400
+  @biomejs/biome@2.3.15
+  typescript@5.9.3
+  typescript-language-server@6.0.1
+)
 ARCH="$(uname -m)"
+NODE_ARCH="$(case "$ARCH" in x86_64) echo x64 ;; aarch64) echo arm64 ;; *) echo "$ARCH" ;; esac)"
 
 APT_PACKAGES=(
   zsh zsh-autosuggestions zsh-syntax-highlighting
@@ -73,6 +85,71 @@ install_starship() {
   fi
 }
 
+install_node() {
+  local name="node-v$NODE_VERSION-linux-$NODE_ARCH"
+  local prefix="$HOME/.local/opt/$name"
+  if [[ ! -x "$prefix/bin/node" ]]; then
+    log "node $NODE_VERSION"
+    local tmp
+    tmp="$(mktemp -d)"
+    curl -fsSL -o "$tmp/$name.tar.xz" "https://nodejs.org/dist/v$NODE_VERSION/$name.tar.xz"
+    curl -fsSL -o "$tmp/SHASUMS256.txt" "https://nodejs.org/dist/v$NODE_VERSION/SHASUMS256.txt"
+    (cd "$tmp" && grep " $name.tar.xz\$" SHASUMS256.txt | sha256sum -c --quiet)
+    mkdir -p "$HOME/.local/opt"
+    tar -xJf "$tmp/$name.tar.xz" -C "$HOME/.local/opt"
+    rm -rf "$tmp"
+  fi
+  link "$prefix" "$HOME/.local/opt/node"
+}
+
+install_npm_language_servers() {
+  local prefix="$HOME/.local/opt/lsp" stamp
+  stamp="$NODE_VERSION ${LSP_NPM_PACKAGES[*]}"
+  if [[ "$(cat "$prefix/.stamp" 2>/dev/null)" != "$stamp" ]]; then
+    log "npm language servers: ${LSP_NPM_PACKAGES[*]}"
+    rm -rf "$prefix"
+    mkdir -p "$prefix"
+    PATH="$HOME/.local/opt/node/bin:$PATH" npm install --silent --no-fund --no-audit \
+      --prefix "$prefix" --save-exact "${LSP_NPM_PACKAGES[@]}"
+    echo "$stamp" >"$prefix/.stamp"
+  fi
+  # Wrappers instead of symlinks: the npm shims run `env node`, which must
+  # resolve to this node rather than whatever is first on PATH.
+  local bin
+  for bin in pyright-langserver biome typescript-language-server; do
+    rm -f "$HOME/.local/bin/$bin"
+    cat >"$HOME/.local/bin/$bin" <<EOF
+#!/bin/sh
+PATH="$HOME/.local/opt/node/bin:\$PATH" exec "$prefix/node_modules/.bin/$bin" "\$@"
+EOF
+    chmod +x "$HOME/.local/bin/$bin"
+  done
+}
+
+install_rust_analyzer() {
+  # The standalone release, not the toolchain's rust-analyzer component: that one
+  # is dynamically linked against a librustc_driver that only ships with rustc.
+  local sha
+  case "$ARCH" in
+    x86_64) sha=b2d24ce2bda2ea05b1ad7c2917d205f8111775f703ccd908e6061803ae8257d0 ;;
+    aarch64) sha=32a75657041a7a2ebf635c1e3968753e2639778b68dd4fb13c4b2584255f2ba8 ;;
+  esac
+  local prefix="$HOME/.local/opt/rust-analyzer-$RUST_ANALYZER_VERSION"
+  if [[ ! -x "$prefix/rust-analyzer" ]]; then
+    log "rust-analyzer $RUST_ANALYZER_VERSION"
+    local tmp
+    tmp="$(mktemp -d)"
+    curl -fsSL -o "$tmp/ra.gz" \
+      "https://github.com/rust-lang/rust-analyzer/releases/download/$RUST_ANALYZER_VERSION/rust-analyzer-$ARCH-unknown-linux-gnu.gz"
+    echo "$sha  $tmp/ra.gz" | sha256sum -c --quiet
+    mkdir -p "$prefix"
+    gunzip -c "$tmp/ra.gz" >"$prefix/rust-analyzer"
+    chmod +x "$prefix/rust-analyzer"
+    rm -rf "$tmp"
+  fi
+  link "$prefix/rust-analyzer" "$HOME/.local/bin/rust-analyzer"
+}
+
 link_dotfiles() {
   log "linking dotfiles"
   link "$DOTFILES/zsh/zshrc" "$HOME/.zshrc"
@@ -118,6 +195,9 @@ set_login_shell() {
 install_apt_packages
 install_helix
 install_starship
+install_node
+install_npm_language_servers
+install_rust_analyzer
 link_dotfiles
 install_tmux_plugins
 tune_dirt_repo

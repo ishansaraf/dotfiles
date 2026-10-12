@@ -1,0 +1,44 @@
+# Binaries are installed by ~/dotfiles/personalize, except ruff, which comes from
+# dirt's .bazel_env/bin via direnv so it matches the repo's pinned version.
+
+[language-server.pyright]
+command = "pyright-langserver"
+args = ["--stdio"]
+
+[language-server.ruff]
+command = "ruff"
+args = ["server"]
+
+[language-server.biome]
+command = "biome"
+args = ["lsp-proxy"]
+
+[[language]]
+name = "python"
+language-servers = ["pyright", "ruff"]
+
+[[language]]
+name = "rust"
+# dirt has no Cargo.toml; rust-analyzer reads rust-project.json from `bazel run //:rust-analyzer`.
+roots = ["rust-project.json", "Cargo.toml", "Cargo.lock"]
+
+# Biome is dirt's JS/TS formatter, so tsserver's formatting is turned off to avoid two formatters.
+[[language]]
+name = "typescript"
+language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+
+[[language]]
+name = "tsx"
+language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+
+[[language]]
+name = "javascript"
+language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+
+[[language]]
+name = "jsx"
+language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+
+[[language]]
+name = "json"
+language-servers = ["biome"]
