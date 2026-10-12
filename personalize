@@ -19,6 +19,7 @@ LSP_NPM_PACKAGES=(
   @biomejs/biome@2.3.15
   typescript@5.9.3
   typescript-language-server@6.0.1
+  yaml-language-server@1.24.0
 )
 ARCH="$(uname -m)"
 NODE_ARCH="$(case "$ARCH" in x86_64) echo x64 ;; aarch64) echo arm64 ;; *) echo "$ARCH" ;; esac)"
@@ -116,7 +117,7 @@ install_npm_language_servers() {
   # Wrappers instead of symlinks: the npm shims run `env node`, which must
   # resolve to this node rather than whatever is first on PATH.
   local bin
-  for bin in pyright-langserver biome typescript-language-server; do
+  for bin in pyright-langserver biome typescript-language-server yaml-language-server; do
     rm -f "$HOME/.local/bin/$bin"
     cat >"$HOME/.local/bin/$bin" <<EOF
 #!/bin/sh
@@ -126,28 +127,57 @@ EOF
   done
 }
 
-install_rust_analyzer() {
-  # The standalone release, not the toolchain's rust-analyzer component: that one
-  # is dynamically linked against a librustc_driver that only ships with rustc.
-  local sha
-  case "$ARCH" in
-    x86_64) sha=b2d24ce2bda2ea05b1ad7c2917d205f8111775f703ccd908e6061803ae8257d0 ;;
-    aarch64) sha=32a75657041a7a2ebf635c1e3968753e2639778b68dd4fb13c4b2584255f2ba8 ;;
+# Single-binary editor tools from GitHub releases, pinned by sha256. yamlfmt
+# matches the version and checksums in dirt's MODULE.bazel.
+# Each entry: name version url-template sha-x86_64 sha-aarch64. In the URL,
+# {v} is the version and {a} the per-project arch label from arch_label.
+STANDALONE_TOOLS=(
+  "rust-analyzer $RUST_ANALYZER_VERSION https://github.com/rust-lang/rust-analyzer/releases/download/{v}/rust-analyzer-{a}-unknown-linux-gnu.gz b2d24ce2bda2ea05b1ad7c2917d205f8111775f703ccd908e6061803ae8257d0 32a75657041a7a2ebf635c1e3968753e2639778b68dd4fb13c4b2584255f2ba8"
+  "starpls v0.1.22 https://github.com/withered-magic/starpls/releases/download/{v}/starpls-linux-{a} 7c661cdde0d1c026665086d07523d825671e29056276681616bb32d0273c5eab 55877ec4c3ff03e1d90d59c76f69a3a144b6c29688747c8ac4d77993e2eef1ad"
+  "marksman 2026-02-08 https://github.com/artempyanykh/marksman/releases/download/{v}/marksman-linux-{a} be5098e8213219269c47fc0d916a66fa31ce0602ec967475c722260aabf26087 db8e124527f7f8048e3e6c91821b9c52ef173d92c01e47d221bf1337afd962fb"
+  "yamlfmt 0.17.2 https://github.com/google/yamlfmt/releases/download/v{v}/yamlfmt_{v}_Linux_{a}.tar.gz b114115b6804cfd203195d222558e4feb38e311fffb590c4e13642fa21bd0e37 1785b9751af9dca10a8a3e51ee2f6f3aa64564610dcc994d98421e28d02b56b5"
+  "taplo 0.10.0 https://github.com/tamasfe/taplo/releases/download/{v}/taplo-linux-{a}.gz 8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156 033681d01eec8376c3fd38fa3703c79316f5e14bb013d859943b60a07bccdcc3"
+)
+
+# rust-analyzer is the standalone release, not the toolchain's rust-analyzer
+# component: that one is dynamically linked against a librustc_driver that only
+# ships with rustc.
+arch_label() {
+  case "$1:$ARCH" in
+    starpls:x86_64) echo amd64 ;;
+    marksman:x86_64) echo x64 ;;
+    marksman:aarch64) echo arm64 ;;
+    yamlfmt:aarch64) echo arm64 ;;
+    *) echo "$ARCH" ;;
   esac
-  local prefix="$HOME/.local/opt/rust-analyzer-$RUST_ANALYZER_VERSION"
-  if [[ ! -x "$prefix/rust-analyzer" ]]; then
-    log "rust-analyzer $RUST_ANALYZER_VERSION"
-    local tmp
-    tmp="$(mktemp -d)"
-    curl -fsSL -o "$tmp/ra.gz" \
-      "https://github.com/rust-lang/rust-analyzer/releases/download/$RUST_ANALYZER_VERSION/rust-analyzer-$ARCH-unknown-linux-gnu.gz"
-    echo "$sha  $tmp/ra.gz" | sha256sum -c --quiet
-    mkdir -p "$prefix"
-    gunzip -c "$tmp/ra.gz" >"$prefix/rust-analyzer"
-    chmod +x "$prefix/rust-analyzer"
-    rm -rf "$tmp"
-  fi
-  link "$prefix/rust-analyzer" "$HOME/.local/bin/rust-analyzer"
+}
+
+install_standalone_tools() {
+  local entry name version url sha_x86 sha_arm sha prefix tmp
+  for entry in "${STANDALONE_TOOLS[@]}"; do
+    read -r name version url sha_x86 sha_arm <<<"$entry"
+    prefix="$HOME/.local/opt/$name-$version"
+    if [[ ! -x "$prefix/$name" ]]; then
+      log "$name $version"
+      case "$ARCH" in x86_64) sha="$sha_x86" ;; aarch64) sha="$sha_arm" ;; esac
+      url="${url//\{v\}/$version}"
+      url="${url//\{a\}/$(arch_label "$name")}"
+      tmp="$(mktemp -d)"
+      curl -fsSL -o "$tmp/download" "$url"
+      echo "$sha  $tmp/download" | sha256sum -c --quiet
+      mkdir -p "$prefix"
+      if [[ "$url" == *.tar.gz ]]; then
+        tar -xzf "$tmp/download" -C "$prefix" "$name"
+      elif [[ "$url" == *.gz ]]; then
+        gunzip -c "$tmp/download" >"$prefix/$name"
+      else
+        mv "$tmp/download" "$prefix/$name"
+      fi
+      chmod +x "$prefix/$name"
+      rm -rf "$tmp"
+    fi
+    link "$prefix/$name" "$HOME/.local/bin/$name"
+  done
 }
 
 link_dotfiles() {
@@ -181,6 +211,8 @@ tune_dirt_repo() {
   git -C "$repo" config feature.manyFiles true
   git -C "$repo" config core.untrackedCache true
   git -C "$repo" config core.fsmonitor true
+  link "$DOTFILES/helix/dirt-languages.toml" "$repo/.helix/languages.toml"
+  grep -qxF "/.helix/" "$repo/.git/info/exclude" 2>/dev/null || echo "/.helix/" >>"$repo/.git/info/exclude"
 }
 
 set_login_shell() {
@@ -197,7 +229,7 @@ install_helix
 install_starship
 install_node
 install_npm_language_servers
-install_rust_analyzer
+install_standalone_tools
 link_dotfiles
 install_tmux_plugins
 tune_dirt_repo

@@ -1,5 +1,10 @@
-# Binaries are installed by ~/dotfiles/personalize, except ruff, which comes from
-# dirt's .bazel_env/bin via direnv so it matches the repo's pinned version.
+# Binaries are installed by ~/dotfiles/personalize, except ruff, rustfmt,
+# buildifier and buf, which come from dirt's .bazel_env/bin via direnv so they
+# match the repo's pinned versions.
+#
+# Format-on-save is enabled only for languages `bazel run //:format` formats,
+# using the same tool, so saving never produces a diff the repo would reject
+# or undo. TOML, Markdown and proto are left for manual `:format`.
 
 [language-server.pyright]
 command = "pyright-langserver"
@@ -13,32 +18,95 @@ args = ["server"]
 command = "biome"
 args = ["lsp-proxy"]
 
+[language-server.starpls]
+command = "starpls"
+args = ["server"]
+
+[language-server.buf]
+command = "buf"
+args = ["beta", "lsp", "--timeout", "0"]
+
+[language-server.taplo]
+command = "taplo"
+args = ["lsp", "stdio"]
+
+[language-server.yaml-language-server]
+command = "yaml-language-server"
+args = ["--stdio"]
+
+[language-server.marksman]
+command = "marksman"
+args = ["server"]
+
+# Mirrors tools/format/ruff_format.sh: sort imports, then format. Unlike the
+# repo script it skips the F401/F841 autofixes, which would delete an import or
+# variable you've just written but not used yet. --stdin-filename makes ruff
+# apply ruff.toml's per-path settings to this file.
 [[language]]
 name = "python"
 language-servers = ["pyright", "ruff"]
+auto-format = true
+formatter = { command = "bash", args = ["-o", "pipefail", "-c", "f=\"$PWD/${1##*/}\"; ruff check --select I --fix --exit-zero --quiet --stdin-filename \"$f\" - | ruff format --quiet --stdin-filename \"$f\" -", "ruff-format", "%{buffer_name}"] }
 
+# dirt has no Cargo.toml; rust-analyzer reads rust-project.json from
+# `bazel run //:rust-analyzer`. It formats with rustfmt, which picks up rustfmt.toml.
 [[language]]
 name = "rust"
-# dirt has no Cargo.toml; rust-analyzer reads rust-project.json from `bazel run //:rust-analyzer`.
 roots = ["rust-project.json", "Cargo.toml", "Cargo.lock"]
+auto-format = true
 
-# Biome is dirt's JS/TS formatter, so tsserver's formatting is turned off to avoid two formatters.
+[[language]]
+name = "starlark"
+language-servers = ["starpls"]
+auto-format = true
+formatter = { command = "buildifier", args = ["--path=%{buffer_name}"] }
+
+# Biome is dirt's JS/TS formatter, so tsserver's formatting is turned off.
+# Biome only formats files under the `files.includes` globs in biome.json.
 [[language]]
 name = "typescript"
 language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+auto-format = true
 
 [[language]]
 name = "tsx"
 language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+auto-format = true
 
 [[language]]
 name = "javascript"
 language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+auto-format = true
 
 [[language]]
 name = "jsx"
 language-servers = [{ name = "typescript-language-server", except-features = ["format"] }, "biome"]
+auto-format = true
 
 [[language]]
 name = "json"
 language-servers = ["biome"]
+auto-format = true
+
+# Helix runs formatters from the file's own directory, and %{buffer_name} is
+# relative to where hx was started, so paths below are rebuilt from $PWD.
+#
+# yamlfmt only reads .yamlfmt from its working directory, so find the nearest
+# one above the file; this keeps dirt's `retain_line_breaks_single` setting.
+[[language]]
+name = "yaml"
+language-servers = [{ name = "yaml-language-server", except-features = ["format"] }]
+auto-format = true
+formatter = { command = "bash", args = ["-c", "d=$PWD; while [[ $d != / && ! -f $d/.yamlfmt ]]; do d=$(dirname \"$d\"); done; if [[ -f $d/.yamlfmt ]]; then exec yamlfmt -conf \"$d/.yamlfmt\" -; else exec yamlfmt -; fi"] }
+
+[[language]]
+name = "protobuf"
+language-servers = ["buf"]
+
+[[language]]
+name = "toml"
+language-servers = ["taplo"]
+
+[[language]]
+name = "markdown"
+language-servers = ["marksman"]

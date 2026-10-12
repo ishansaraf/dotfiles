@@ -1,0 +1,10 @@
+# Workspace config for ~/dirt, linked to ~/dirt/.helix/languages.toml by
+# personalize and hidden from git via .git/info/exclude.
+#
+# Without linkedProjects, rust-analyzer falls back to discovering Cargo
+# workspaces, finds rust_crates/Cargo.toml (the crate_universe manifest) and runs
+# `cargo metadata`, which rewrites rust_crates/Cargo.lock. Pointing it only at
+# the generated rust-project.json stops that; until one exists, rust-analyzer
+# reports a missing project instead of touching the lockfile.
+[language-server.rust-analyzer.config]
+linkedProjects = ["rust-project.json"]
