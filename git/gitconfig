@@ -1,0 +1,38 @@
+[user]
+	name = Ishan Saraf
+	email = ishan.saraf@bedrockrobotics.com
+[core]
+	editor = hx
+	pager = delta
+[interactive]
+	diffFilter = delta --color-only
+[delta]
+	navigate = true
+	line-numbers = true
+[init]
+	defaultBranch = main
+[diff]
+	algorithm = histogram
+	colorMoved = default
+[merge]
+	conflictstyle = zdiff3
+[pull]
+	ff = only
+[push]
+	autoSetupRemote = true
+[fetch]
+	prune = true
+[rebase]
+	updateRefs = true
+	autoStash = true
+[rerere]
+	enabled = true
+[branch]
+	sort = -committerdate
+[alias]
+	st = status -sb
+	co = checkout
+	sw = switch
+	lg = log --graph --oneline --decorate
+	amend = commit --amend --no-edit
+	wt = worktree

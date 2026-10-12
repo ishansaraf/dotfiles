@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Devbox bootstrap. cloud-init runs ~/personalize (a symlink to this file) as
+# `ubuntu` on every box launch; output lands in ~/.personalize.log. /home is a
+# persistent EBS volume but the root disk is not, so apt packages and the login
+# shell are redone each launch while ~/.local installs are skipped when current.
+# Safe to re-run by hand after editing.
+set -euo pipefail
+
+DOTFILES="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+HELIX_VERSION=25.07.1
+STARSHIP_VERSION=1.26.0
+ARCH="$(uname -m)"
+
+APT_PACKAGES=(
+  zsh zsh-autosuggestions zsh-syntax-highlighting
+  fzf fd-find bat eza zoxide git-delta
+  mosh btop ncdu gh
+)
+
+log() { printf '\n==> %s\n' "$*"; }
+
+link() {
+  local src="$1" dst="$2"
+  mkdir -p "$(dirname "$dst")"
+  if [[ -e "$dst" && ! -L "$dst" ]]; then
+    mv "$dst" "$dst.pre-dotfiles.$(date +%s)"
+  fi
+  ln -sfn "$src" "$dst"
+}
+
+install_apt_packages() {
+  log "apt packages"
+  if [[ ! -f /etc/apt/sources.list.d/github-cli.list ]]; then
+    sudo mkdir -p -m 755 /etc/apt/keyrings
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+    sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+  fi
+  sudo apt-get update -q
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${APT_PACKAGES[@]}"
+}
+
+install_helix() {
+  local prefix="$HOME/.local/opt/helix-$HELIX_VERSION"
+  if [[ ! -x "$prefix/hx" ]]; then
+    log "helix $HELIX_VERSION"
+    local tmp
+    tmp="$(mktemp -d)"
+    curl -fsSL -o "$tmp/helix.tar.xz" \
+      "https://github.com/helix-editor/helix/releases/download/$HELIX_VERSION/helix-$HELIX_VERSION-$ARCH-linux.tar.xz"
+    mkdir -p "$prefix"
+    tar -xJf "$tmp/helix.tar.xz" -C "$prefix" --strip-components=1
+    rm -rf "$tmp"
+  fi
+  # hx finds its runtime/ next to the resolved binary, so a symlink is enough.
+  link "$prefix/hx" "$HOME/.local/bin/hx"
+}
+
+install_starship() {
+  if [[ "$("$HOME/.local/bin/starship" --version 2>/dev/null | head -1)" != "starship $STARSHIP_VERSION" ]]; then
+    log "starship $STARSHIP_VERSION"
+    local tmp asset
+    tmp="$(mktemp -d)"
+    asset="starship-$ARCH-unknown-linux-musl.tar.gz"
+    curl -fsSL -o "$tmp/$asset" "https://github.com/starship/starship/releases/download/v$STARSHIP_VERSION/$asset"
+    curl -fsSL -o "$tmp/$asset.sha256" "https://github.com/starship/starship/releases/download/v$STARSHIP_VERSION/$asset.sha256"
+    (cd "$tmp" && echo "$(cat "$asset.sha256")  $asset" | sha256sum -c --quiet)
+    mkdir -p "$HOME/.local/bin"
+    tar -xzf "$tmp/$asset" -C "$HOME/.local/bin" starship
+    rm -rf "$tmp"
+  fi
+}
+
+link_dotfiles() {
+  log "linking dotfiles"
+  link "$DOTFILES/zsh/zshrc" "$HOME/.zshrc"
+  link "$DOTFILES/tmux/tmux.conf" "$HOME/.tmux.conf"
+  link "$DOTFILES/starship.toml" "$HOME/.config/starship.toml"
+  link "$DOTFILES/helix" "$HOME/.config/helix"
+  link "$DOTFILES/personalize" "$HOME/personalize"
+  # Ubuntu ships these under different names to avoid package conflicts.
+  link /usr/bin/fdfind "$HOME/.local/bin/fd"
+  link /usr/bin/batcat "$HOME/.local/bin/bat"
+  # ~/.gitconfig stays as the machine-local file (git lfs writes to it); ours is included.
+  if ! git config --global --get-all include.path | grep -qxF "$DOTFILES/git/gitconfig"; then
+    git config --global --add include.path "$DOTFILES/git/gitconfig"
+  fi
+}
+
+install_tmux_plugins() {
+  log "tmux plugins"
+  if [[ ! -d "$HOME/.tmux/plugins/tpm" ]]; then
+    git clone -q --depth 1 https://github.com/tmux-plugins/tpm "$HOME/.tmux/plugins/tpm"
+  fi
+  "$HOME/.tmux/plugins/tpm/bin/install_plugins" >/dev/null
+}
+
+tune_dirt_repo() {
+  local repo="$HOME/dirt"
+  [[ -d "$repo/.git" ]] || return 0
+  log "git tuning for $repo"
+  git -C "$repo" config feature.manyFiles true
+  git -C "$repo" config core.untrackedCache true
+  git -C "$repo" config core.fsmonitor true
+}
+
+set_login_shell() {
+  local zsh_path
+  zsh_path="$(command -v zsh)"
+  if [[ "$(getent passwd "$USER" | cut -d: -f7)" != "$zsh_path" ]]; then
+    log "login shell -> $zsh_path"
+    sudo chsh -s "$zsh_path" "$USER"
+  fi
+}
+
+install_apt_packages
+install_helix
+install_starship
+link_dotfiles
+install_tmux_plugins
+tune_dirt_repo
+set_login_shell
+log "done"

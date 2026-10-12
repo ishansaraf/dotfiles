@@ -1,0 +1,62 @@
+export PATH="$HOME/.local/bin:$PATH"
+export EDITOR=hx VISUAL=hx
+export PAGER=less LESS=-FRX
+export BAT_THEME=ansi
+
+HISTFILE=~/.zsh_history
+HISTSIZE=200000
+SAVEHIST=200000
+setopt extended_history share_history hist_ignore_all_dups hist_ignore_space hist_reduce_blanks
+setopt auto_cd auto_pushd pushd_ignore_dups interactive_comments no_beep
+
+autoload -Uz compinit && compinit -d ~/.cache/zcompdump
+zstyle ':completion:*' menu select
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}'
+zstyle ':completion:*' list-colors ''
+
+# zsh picks vi mode when $EDITOR contains "vi" and stays emacs otherwise; set it explicitly.
+bindkey -e
+WORDCHARS=${WORDCHARS//\/}
+
+autoload -Uz up-line-or-beginning-search down-line-or-beginning-search edit-command-line
+zle -N up-line-or-beginning-search
+zle -N down-line-or-beginning-search
+zle -N edit-command-line
+bindkey '^[[A' up-line-or-beginning-search
+bindkey '^[OA' up-line-or-beginning-search
+bindkey '^[[B' down-line-or-beginning-search
+bindkey '^[OB' down-line-or-beginning-search
+bindkey '^X^E' edit-command-line
+bindkey '^[[H' beginning-of-line
+bindkey '^[[F' end-of-line
+bindkey '^[[3~' delete-char
+bindkey '^[[1;5C' forward-word
+bindkey '^[[1;5D' backward-word
+
+export FZF_DEFAULT_COMMAND='fd --type f --hidden --exclude .git'
+export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
+export FZF_ALT_C_COMMAND='fd --type d --hidden --exclude .git'
+export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border'
+[[ -f /usr/share/doc/fzf/examples/key-bindings.zsh ]] && source /usr/share/doc/fzf/examples/key-bindings.zsh
+[[ -f /usr/share/doc/fzf/examples/completion.zsh ]] && source /usr/share/doc/fzf/examples/completion.zsh
+
+alias ls='eza --group-directories-first'
+alias ll='eza -l --git --group-directories-first'
+alias la='eza -la --git --group-directories-first'
+alias tree='eza --tree'
+alias g=git
+alias gs='git status -sb'
+alias lg='git log --graph --oneline --decorate'
+
+# Attach to the named tmux session, creating it if needed: `t`, `t dirt`.
+t() { tmux new-session -A -s "${1:-main}"; }
+
+command -v zoxide >/dev/null && eval "$(zoxide init zsh)"
+command -v direnv >/dev/null && eval "$(direnv hook zsh)"
+command -v starship >/dev/null && eval "$(starship init zsh)"
+
+[[ -f ~/.zshrc.local ]] && source ~/.zshrc.local
+
+[[ -f /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh ]] && source /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+# Must be sourced last so it wraps every widget defined above.
+[[ -f /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ]] && source /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
