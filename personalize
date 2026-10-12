@@ -180,6 +180,24 @@ install_standalone_tools() {
   done
 }
 
+install_completions() {
+  log "zsh completions"
+  local dir="$HOME/.local/share/zsh/site-functions" bazel_env="$HOME/dirt/.bazel_env/bin"
+  mkdir -p "$dir"
+  link "$HOME/.local/opt/helix-$HELIX_VERSION/contrib/completion/hx.zsh" "$dir/_hx"
+  "$HOME/.local/bin/starship" completions zsh >"$dir/_starship"
+  # Generated from dirt's pinned tools so completions match those versions;
+  # regenerated each run, so a version bump in the repo is picked up here.
+  if [[ -d "$bazel_env" ]]; then
+    "$bazel_env/uv" generate-shell-completion zsh >"$dir/_uv"
+    "$bazel_env/ruff" generate-shell-completion zsh >"$dir/_ruff"
+    "$bazel_env/buf" completion zsh >"$dir/_buf"
+    "$bazel_env/pnpm" completion zsh >"$dir/_pnpm"
+  fi
+  # compinit caches the function list; drop it so new completions are found.
+  rm -f "$HOME/.cache/zsh/zcompdump"*
+}
+
 link_dotfiles() {
   log "linking dotfiles"
   link "$DOTFILES/zsh/zshrc" "$HOME/.zshrc"
@@ -231,6 +249,7 @@ install_node
 install_npm_language_servers
 install_standalone_tools
 link_dotfiles
+install_completions
 install_tmux_plugins
 tune_dirt_repo
 set_login_shell

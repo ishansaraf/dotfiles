@@ -34,6 +34,9 @@
 [rebase]
 	updateRefs = true
 	autoStash = true
+[help]
+	# `git stauts` -> asks to run `git status`.
+	autocorrect = prompt
 [rerere]
 	enabled = true
 [branch]
