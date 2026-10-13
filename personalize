@@ -205,6 +205,9 @@ link_dotfiles() {
   link "$DOTFILES/starship.toml" "$HOME/.config/starship.toml"
   link "$DOTFILES/helix" "$HOME/.config/helix"
   link "$DOTFILES/personalize" "$HOME/personalize"
+  link "$DOTFILES/herdr/config.toml" "$HOME/.config/herdr/config.toml"
+  link "$DOTFILES/bin/wt" "$HOME/.local/bin/wt"
+  link "$DOTFILES/wt/init" "$HOME/.config/wt/init"
   # Ubuntu ships these under different names to avoid package conflicts.
   link /usr/bin/fdfind "$HOME/.local/bin/fd"
   link /usr/bin/batcat "$HOME/.local/bin/bat"
@@ -229,6 +232,8 @@ tune_dirt_repo() {
   git -C "$repo" config feature.manyFiles true
   git -C "$repo" config core.untrackedCache true
   git -C "$repo" config core.fsmonitor true
+  # Parallel checkout cuts a fresh worktree from ~4.6s to ~3s on 8 cores (wt creates many).
+  git -C "$repo" config checkout.workers 0
   link "$DOTFILES/helix/dirt-languages.toml" "$repo/.helix/languages.toml"
   grep -qxF "/.helix/" "$repo/.git/info/exclude" 2>/dev/null || echo "/.helix/" >>"$repo/.git/info/exclude"
 }

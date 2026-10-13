@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# `wt` init hook: bootstraps a new worktree. Runs with the worktree as $PWD, WT_PATH
+# (the worktree), WT_REPO (the main checkout) and WT_BRANCH set. Output goes to
+# ~/.local/state/wt/<name>.log. Idempotent, so it is safe to re-run by hand.
+# Repo-specific steps are keyed on the main checkout's directory name.
+set -euo pipefail
+
+DOTFILES="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+init_dirt() {
+  # /.helix/ is already in the shared .git/info/exclude (see personalize).
+  mkdir -p .helix
+  ln -sfn "$DOTFILES/helix/dirt-languages.toml" .helix/languages.toml
+
+  local env_local=apps/robots-build/.env.local
+  if [ -f "$WT_REPO/$env_local" ] && [ ! -e "$env_local" ]; then
+    cp -n "$WT_REPO/$env_local" "$env_local"
+  fi
+
+  # First, because the pane's shell prompts (and direnv loads .envrc) right as the
+  # worktree opens; allowing after the slow bazel step shows "is blocked" meanwhile.
+  direnv allow .
+
+  bazel run //:bazel_env
+
+  # Slow and not needed by most agent work; opt in with WT_INIT_VENV=1.
+  if [ "${WT_INIT_VENV:-0}" = 1 ]; then
+    bazel run //:venv
+  fi
+}
+
+case "$(basename "$WT_REPO")" in
+  dirt) init_dirt ;;
+esac

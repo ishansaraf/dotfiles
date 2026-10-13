@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# Spin up a herdr worktree workspace with an agent running in it, and bootstrap its
+# environment in the background.
+#   wt <name> [--base REF] [--no-agent]   create worktree + workspace, start the agent
+#   wt rm <name> [--force]                remove the worktree, its workspace and branch
+#
+# Env setup is the executable hook at ~/.config/wt/init (run inside the new worktree).
+# While it runs, the workspace shows a "setup" token in the herdr sidebar; the token
+# clears on success and turns into "setup FAILED" if the hook exits non-zero. Hook
+# output goes to ~/.local/state/wt/<name>.log.
+set -euo pipefail
+
+BRANCH_PREFIX=${WT_BRANCH_PREFIX-ishan/}
+AGENT_CMD=${WT_AGENT_CMD-claude}
+INIT_HOOK=${WT_INIT_HOOK:-$HOME/.config/wt/init}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/wt
+SOURCE=wt
+# A crashed hook must not leave "setting up" on screen forever; 86400000 is herdr's max.
+SETUP_TTL_MS=3600000
+FAILED_TTL_MS=86400000
+
+herdr_cmd() {
+  if [ -n "${WT_HERDR_SESSION:-}" ]; then
+    herdr --session "$WT_HERDR_SESSION" "$@"
+  else
+    herdr "$@"
+  fi
+}
+
+die() {
+  echo "wt: $*" >&2
+  exit 1
+}
+
+usage() {
+  die "usage: wt <name> [--base REF] [--no-agent] | wt rm <name> [--force]"
+}
+
+check_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid name '$1' (letters, digits, . _ - only)"
+}
+
+repo_root() {
+  local gitdir
+  gitdir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || die "not inside a git repository"
+  dirname "$gitdir"
+}
+
+set_setup_token() {
+  herdr_cmd workspace report-metadata "$1" --source "$SOURCE" --token "setup=$2" --ttl-ms "$3" >/dev/null
+}
+
+clear_setup_token() {
+  herdr_cmd workspace report-metadata "$1" --source "$SOURCE" --clear-token setup >/dev/null
+}
+
+# Runs detached from `wt create` (see below), so it must report its own outcome.
+run_init() {
+  local ws=$1 path=$2 repo=$3 branch=$4
+  if [ ! -x "$INIT_HOOK" ]; then
+    clear_setup_token "$ws"
+    return 0
+  fi
+  if (cd "$path" && WT_PATH=$path WT_REPO=$repo WT_BRANCH=$branch "$INIT_HOOK"); then
+    clear_setup_token "$ws"
+  else
+    set_setup_token "$ws" "setup FAILED" "$FAILED_TTL_MS"
+    return 1
+  fi
+}
+
+create() {
+  local name=$1 base=$2 start_agent=$3
+  check_name "$name"
+  local repo branch out ws pane path
+  repo=$(repo_root)
+  branch=$BRANCH_PREFIX$name
+
+  local args=(worktree create --cwd "$repo" --branch "$branch" --label "$name" --no-focus)
+  [ -n "$base" ] && args+=(--base "$base")
+  echo "wt: creating worktree $branch (checkout takes a few seconds)..."
+  out=$(herdr_cmd "${args[@]}") || die "herdr worktree create failed"
+  ws=$(jq -er '.result.workspace.workspace_id' <<<"$out")
+  pane=$(jq -er '.result.root_pane.pane_id' <<<"$out")
+  path=$(jq -er '.result.worktree.path' <<<"$out")
+
+  mkdir -p "$STATE_DIR"
+  local log=$STATE_DIR/$name.log
+  set_setup_token "$ws" "setting up" "$SETUP_TTL_MS"
+  setsid nohup "$(readlink -f "${BASH_SOURCE[0]}")" _init "$ws" "$path" "$repo" "$branch" \
+    >"$log" 2>&1 </dev/null &
+
+  # Input typed into the pane's PTY is queued until its shell reads it, so this is
+  # safe even if the shell is still starting.
+  [ "$start_agent" = 1 ] && herdr_cmd pane run "$pane" "$AGENT_CMD" >/dev/null
+  herdr_cmd workspace focus "$ws" >/dev/null
+
+  echo "wt: $branch -> $path (workspace $ws)"
+  echo "wt: env setup log: $log"
+}
+
+remove() {
+  local name=$1 force=$2
+  check_name "$name"
+  local repo branch out ws path
+  repo=$(repo_root)
+  branch=$BRANCH_PREFIX$name
+
+  out=$(herdr_cmd worktree list --cwd "$repo") || die "herdr worktree list failed"
+  path=$(jq -r --arg b "$branch" '[.result.worktrees[] | select(.branch == $b)] | first | .path // empty' <<<"$out")
+  ws=$(jq -r --arg b "$branch" '[.result.worktrees[] | select(.branch == $b)] | first | .open_workspace_id // empty' <<<"$out")
+  [ -n "$path" ] || die "no worktree for branch $branch"
+
+  local rm_args=()
+  [ "$force" = 1 ] && rm_args+=(--force)
+  if [ -n "$ws" ]; then
+    herdr_cmd worktree remove --workspace "$ws" "${rm_args[@]}" >/dev/null || die "herdr worktree remove failed (uncommitted changes? use --force)"
+  else
+    git -C "$repo" worktree remove "${rm_args[@]}" "$path" || die "git worktree remove failed"
+  fi
+
+  # -d only deletes merged branches; a squash-merged branch needs --force (-D).
+  local delete_flag=-d
+  [ "$force" = 1 ] && delete_flag=-D
+  if git -C "$repo" branch "$delete_flag" "$branch" >/dev/null 2>&1; then
+    echo "wt: removed $path and branch $branch"
+  else
+    echo "wt: removed $path; kept branch $branch (not merged; 'wt rm $name --force' or git branch -D)"
+  fi
+}
+
+main() {
+  [ $# -ge 1 ] || usage
+  command -v herdr >/dev/null || die "herdr not found"
+  command -v jq >/dev/null || die "jq not found"
+
+  case "$1" in
+    _init)
+      shift
+      [ $# -eq 4 ] || usage
+      run_init "$@"
+      ;;
+    rm)
+      shift
+      local name="" force=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --force) force=1 ;;
+          -*) usage ;;
+          *) [ -z "$name" ] || usage; name=$1 ;;
+        esac
+        shift
+      done
+      [ -n "$name" ] || usage
+      remove "$name" "$force"
+      ;;
+    -*) usage ;;
+    *)
+      local name=$1 base="" start_agent=1
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --base) [ $# -ge 2 ] || usage; base=$2; shift ;;
+          --no-agent) start_agent=0 ;;
+          *) usage ;;
+        esac
+        shift
+      done
+      create "$name" "$base" "$start_agent"
+      ;;
+  esac
+}
+
+main "$@"
