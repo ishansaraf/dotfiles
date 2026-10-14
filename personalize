@@ -238,6 +238,14 @@ tune_dirt_repo() {
   grep -qxF "/.helix/" "$repo/.git/info/exclude" 2>/dev/null || echo "/.helix/" >>"$repo/.git/info/exclude"
 }
 
+# The laptop's TERM=xterm-ghostty is unknown to a fresh devbox, and zsh's line editor
+# misbehaves (doubled characters) without a terminfo entry for it.
+install_terminfo() {
+  infocmp xterm-ghostty >/dev/null 2>&1 && return 0
+  log "terminfo -> xterm-ghostty"
+  tic -x "$DOTFILES/ghostty/xterm-ghostty.terminfo"
+}
+
 set_login_shell() {
   local zsh_path
   zsh_path="$(command -v zsh)"
@@ -257,5 +265,6 @@ link_dotfiles
 install_completions
 install_tmux_plugins
 tune_dirt_repo
+install_terminfo
 set_login_shell
 log "done"

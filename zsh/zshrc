@@ -1,4 +1,7 @@
 export PATH="$HOME/.local/bin:$PATH"
+# Without a terminfo entry for $TERM, zsh's line editor garbles input (doubled characters).
+# personalize installs xterm-ghostty; this covers any other unknown terminal.
+infocmp "$TERM" &>/dev/null || export TERM=xterm-256color
 export EDITOR=hx VISUAL=hx
 export PAGER=less LESS=-FRX
 # ansi makes bat and delta use the terminal's 16-color palette, i.e. Gruvbox Material.
