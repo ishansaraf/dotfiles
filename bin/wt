@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Spin up a herdr worktree workspace with an agent running in it, and bootstrap its
-# environment in the background.
+# environment in the background. The default agent is Claude with Remote Control on,
+# named after the worktree; override the whole command with WT_AGENT_CMD.
 #   wt <name> [--base REF] [--no-agent]   create worktree + workspace, start the agent
 #   wt rm <name> [--force]                remove the worktree, its workspace and branch
 #
@@ -11,7 +12,7 @@
 set -euo pipefail
 
 BRANCH_PREFIX=${WT_BRANCH_PREFIX-ishan/}
-AGENT_CMD=${WT_AGENT_CMD-claude}
+AGENT_CMD=${WT_AGENT_CMD:-}
 INIT_HOOK=${WT_INIT_HOOK:-$HOME/.config/wt/init}
 STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/wt
 SOURCE=wt
@@ -93,7 +94,7 @@ create() {
 
   # Input typed into the pane's PTY is queued until its shell reads it, so this is
   # safe even if the shell is still starting.
-  [ "$start_agent" = 1 ] && herdr_cmd pane run "$pane" "$AGENT_CMD" >/dev/null
+  [ "$start_agent" = 1 ] && herdr_cmd pane run "$pane" "${AGENT_CMD:-claude --remote-control $name}" >/dev/null
   herdr_cmd workspace focus "$ws" >/dev/null
 
   echo "wt: $branch -> $path (workspace $ws)"
