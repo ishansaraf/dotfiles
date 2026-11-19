@@ -26,3 +26,19 @@ pane's process ID, so the skill never attaches to another Hunk window in the sam
 `claude/skills/hunk-review` is Hunk's own pointer skill (MIT), which loads its instructions from the
 installed `hunk` CLI. `personalize` links all three into place; elsewhere, link `bin/hunk-pane` onto
 `PATH` and both skill directories into `~/.claude/skills/`.
+
+## Rex: worktree sessions
+
+`rex/` is the laptop's [Rex](https://www.superlogical.com/rex) setup: link `rex/init.lua` to
+`~/.config/rex/init.lua` and `rex/wt` to `~/.local/bin/wt`. `rex/wt` is a Rex port of `bin/wt`: one Rex
+session per git worktree, with Claude running in it.
+
+- `ctrl+b w` (or "New Worktree Session…" in the command palette) asks which host to use (this Mac or any
+  ssh host from `rex hosts`), a name, and an optional first message for Claude, which you can write in
+  Helix in a floating pane. A stopped Coder workspace is offered a start; the session is created once
+  it's up.
+- `ctrl+b o` reopens a worktree's session, `ctrl+b x` removes the one you're in, `ctrl+b p` cleans up
+  unused ones (this Mac only).
+
+On a remote host the session is created by running `rex/wt` there over ssh, as `~/.local/bin/wt-rex`
+(`personalize` links it; the devbox's `wt` stays the herdr one), in `~/dirt`.

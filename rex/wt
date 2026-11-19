@@ -1,0 +1,767 @@
+#!/usr/bin/env bash
+# Rex port of bin/wt: one Rex session per git worktree, with an agent running in it.
+#   wt <name> [--base REF] [--no-agent] [--prompt TEXT]
+#                            create worktree + session, start the agent
+#   wt open <name>           reopen a session for an existing worktree, resuming the agent
+#   wt rm <name> [--force]   remove the worktree, its branch and its session
+#   wt prompt                form for the name and an optional first prompt (Rex ctrl+b w)
+#   wt pick                  pick a worktree to open (Rex ctrl+b o)
+#   wt rm-here               confirm, then remove the worktree you're in (Rex ctrl+b x)
+#   wt prune [--yes]         remove every worktree with no open session, no uncommitted
+#                            changes and no commits missing from both the remotes and its
+#                            merged PR (Rex ctrl+b p)
+#
+# A worktree is named by its directory, which stays fixed while its branch or its Rex
+# session's label change.
+#
+# New branches start from a fresh fetch of origin's default branch (origin/main for dirt);
+# --base REF overrides it, e.g. --base HEAD to stack on the main checkout's branch.
+#
+# Creating returns at once: the new session appears in the sidebar and does the fetch and
+# checkout in its own first pane, then drops into a shell in the worktree running the
+# agent. It never takes focus. LFS files are skipped at checkout and pulled in a
+# background "setup" tab, followed by the env hook at ~/.config/wt/init. Panes report
+# progress with the Program Status Protocol (OSC 7501), so the session shows a spinner
+# while they work. The setup tab closes on success and stays open on failure; its output
+# is also written to ~/.local/state/wt/<name>.log.
+#
+# The default agent is Claude with Remote Control on, named after the worktree; override
+# the whole command with WT_AGENT_CMD.
+set -euo pipefail
+
+BRANCH_PREFIX=${WT_BRANCH_PREFIX-ishan/}
+AGENT_CMD=${WT_AGENT_CMD:-}
+INIT_HOOK=${WT_INIT_HOOK:-$HOME/.config/wt/init}
+DEFAULT_REPO=${WT_DEFAULT_REPO:-$HOME/Development/dirt}
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/wt
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+die() {
+  echo "wt: $*" >&2
+  exit 1
+}
+
+usage() {
+  die "usage: wt <name> [--base REF] [--no-agent] [--prompt TEXT] | wt open <name> | wt rm <name> [--force] | wt prune [--yes] | wt prompt | wt pick | wt rm-here"
+}
+
+check_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "invalid name '$1' (letters, digits, . _ - only)"
+}
+
+repo_root() {
+  local gitdir
+  if gitdir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    dirname "$gitdir"
+  elif [ -d "$DEFAULT_REPO/.git" ]; then
+    echo "$DEFAULT_REPO"
+  else
+    die "not inside a git repository (and WT_DEFAULT_REPO=$DEFAULT_REPO isn't one)"
+  fi
+}
+
+# Worktrees sit beside the main checkout: ~/Development/dirt -> ~/Development/dirt.worktrees/<name>.
+worktree_path() {
+  echo "${WT_ROOT:-$1.worktrees}/$2"
+}
+
+# Worktrees are found by directory, since the branch checked out in one can change.
+is_worktree() {
+  git -C "$1" worktree list --porcelain | grep -qxF "worktree $2"
+}
+
+# Lines of "path<TAB>branch" for the worktrees wt manages (branch is empty when detached).
+list_worktrees() {
+  local repo=$1 root
+  root=$(dirname "$(worktree_path "$repo" x)")
+  git -C "$repo" worktree list --porcelain \
+    | awk '/^worktree /{p=substr($0,10); b=""} /^branch refs\/heads\//{b=substr($0,19)} /^$/{print p "\t" b}
+           END{if (p != "") print p "\t" b}' \
+    | sort -u | awk -F'\t' -v r="$root/" 'index($1, r) == 1 && index(substr($1, length(r) + 1), "/") == 0'
+}
+
+# Claude renames its Rex session to describe its task, so sessions are found by the ID
+# recorded when they were opened, falling back to the label.
+session_id_for() {
+  local sessions recorded=""
+  sessions=$(rex ls --json)
+  [ -f "$STATE_DIR/$1.session" ] && recorded=$(<"$STATE_DIR/$1.session")
+  jq -r --arg id "$recorded" --arg l "$1" \
+    '([.sessions[] | select(.session_id == $id)] + [.sessions[] | select(.label == $l)]) | first | .session_id // empty' \
+    <<<"$sessions"
+}
+
+record_session() {
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$REX_SESSION" >"$STATE_DIR/$1.session"
+}
+
+select_session() {
+  local err
+  if ! err=$(rex do session.select session_id="$1" 2>&1 >/dev/null); then
+    echo "wt: session is open in the sidebar; couldn't switch to it: ${err#Error: }"
+  fi
+}
+
+# OSC 7501: state, then an optional one-line message.
+status() {
+  local msg=""
+  [ $# -ge 2 ] && msg=":msg=$(printf '%s' "$2" | base64 | tr -d '\n')"
+  printf '\e]7501;state=%s:app=wt%s\e\\' "$1" "$msg"
+}
+
+uses_lfs() {
+  grep -qs 'filter=lfs' "$1/.gitattributes"
+}
+
+rename_my_tab() {
+  rex window rename "$(rex block inspect "$REX_BLOCK" --json | jq -r '.block.window_id')" "$1" >/dev/null 2>&1 || true
+}
+
+# Types the agent command into this pane; the shell exec'd afterwards reads it, so the
+# pane drops back to a shell in the worktree when the agent exits.
+queue_agent() {
+  rex send -s "$REX_SESSION" -b "$REX_BLOCK" "$1" >/dev/null \
+    && rex send-key -s "$REX_SESSION" -b "$REX_BLOCK" enter >/dev/null
+}
+
+# Validates in the caller's terminal so mistakes show up in the prompt, then hands the
+# slow part to the new session and returns.
+create() {
+  local name=$1 base=$2 start_agent=$3 first_prompt=$4
+  check_name "$name"
+  command -v rex >/dev/null || die "rex not found"
+  command -v jq >/dev/null || die "jq not found"
+  local repo branch path
+  repo=$(repo_root)
+  branch=$BRANCH_PREFIX$name
+  path=$(worktree_path "$repo" "$name")
+
+  [ -z "$(session_id_for "$name")" ] || die "a Rex session for '$name' already exists"
+  [ ! -e "$path" ] || die "$path already exists (reopen it with: wt open $name)"
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+    [ -z "$base" ] || die "branch $branch already exists; drop --base to check it out"
+  fi
+
+  # The agent command is typed into a shell, so the prompt goes through a file rather than
+  # being quoted onto the command line, where a newline would submit it early.
+  mkdir -p "$STATE_DIR"
+  rm -f "$STATE_DIR/$name.prompt"
+  [ -z "$first_prompt" ] || printf '%s' "$first_prompt" >"$STATE_DIR/$name.prompt"
+
+  # The pane's terminal starts from the login environment, not ours.
+  rex new "$name" -c "$repo" --window "$name" -- \
+    env WT_INIT_HOOK="$INIT_HOOK" WT_AGENT_CMD="$AGENT_CMD" WT_BRANCH_PREFIX="$BRANCH_PREFIX" \
+    "$SELF" _bootstrap "$name" "$repo" "$path" "$branch" "$start_agent" "$base" >/dev/null \
+    || die "rex new failed"
+  echo "wt: started session $name ($branch -> $path)"
+}
+
+# origin/HEAD names origin's default branch; without a remote, branch from HEAD.
+default_base() {
+  git -C "$1" rev-parse --abbrev-ref origin/HEAD 2>/dev/null \
+    || { git -C "$1" remote get-url origin >/dev/null 2>&1 && echo origin/main; } \
+    || echo HEAD
+}
+
+# Runs as the new session's first pane. Ends by becoming a shell in the worktree.
+bootstrap() {
+  local name=$1 repo=$2 path=$3 branch=$4 start_agent=$5 base=$6
+  record_session "$name"
+  mkdir -p "$(dirname "$path")"
+  local args=(worktree add)
+  if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+    args+=("$path" "$branch")
+  else
+    [ -n "$base" ] || base=$(default_base "$repo")
+    if [[ "$base" == origin/* ]]; then
+      status working "fetching $base"
+      echo "wt: fetching $base"
+      git -C "$repo" fetch origin "${base#origin/}" \
+        || echo "wt: fetch failed; branching from the last fetched $base"
+    fi
+    args+=(--no-track -b "$branch" "$path" "$base")
+  fi
+  status working "checking out $branch"
+  echo "wt: checking out $branch at $path"
+  if ! GIT_LFS_SKIP_SMUDGE=1 git -C "$repo" "${args[@]}"; then
+    status error "checkout FAILED"
+    echo
+    echo "wt: checkout failed; this shell is in the main checkout."
+    cd "$repo"
+    exec "${SHELL:-/bin/zsh}" -l
+  fi
+
+  if uses_lfs "$path" || [ -x "$INIT_HOOK" ]; then
+    rex window new -s "$REX_SESSION" setup -c "$path" --focus=false -- \
+      env WT_INIT_HOOK="$INIT_HOOK" "$SELF" _setup "$name" "$path" "$repo" "$branch" >/dev/null \
+      || echo "wt: couldn't open the setup tab; run '$SELF _setup $name $path $repo $branch' by hand"
+  fi
+
+  rename_my_tab "$name"
+  if [ "$start_agent" = 1 ]; then
+    local cmd=${AGENT_CMD:-claude --remote-control $name}
+    [ -s "$STATE_DIR/$name.prompt" ] && cmd+=" \"\$(<'$STATE_DIR/$name.prompt')\""
+    queue_agent "$cmd"
+  fi
+  status clear
+  clear
+  cd "$path"
+  exec "${SHELL:-/bin/zsh}" -l
+}
+
+# Runs in the session's "setup" tab.
+run_setup() {
+  local name=$1 path=$2 repo=$3 branch=$4
+  mkdir -p "$STATE_DIR"
+  local log=$STATE_DIR/$name.log
+  : >"$log"
+  cd "$path"
+  if uses_lfs "$path"; then
+    status working "pulling LFS files"
+    echo "wt: git lfs pull" | tee -a "$log"
+    if ! git lfs pull 2>&1 | tee -a "$log"; then
+      fail_setup "LFS pull FAILED" "$log"
+    fi
+  fi
+  if [ -x "$INIT_HOOK" ]; then
+    status working "running env setup"
+    echo "wt: running $INIT_HOOK" | tee -a "$log"
+    if ! (WT_PATH=$path WT_REPO=$repo WT_BRANCH=$branch "$INIT_HOOK") 2>&1 | tee -a "$log"; then
+      fail_setup "setup FAILED" "$log"
+    fi
+  fi
+  status done "setup finished"
+  exit 0
+}
+
+fail_setup() {
+  status error "$1"
+  rename_my_tab "$1"
+  echo
+  echo "wt: $1; log: $2. This tab stays open; close it when done."
+  exec "${SHELL:-/bin/zsh}" -l
+}
+
+open_worktree() {
+  local name=$1
+  check_name "$name"
+  local repo path session
+  repo=$(repo_root)
+  path=$(worktree_path "$repo" "$name")
+  is_worktree "$repo" "$path" || die "no worktree at $path (create it with: wt $name)"
+
+  session=$(session_id_for "$name")
+  if [ -n "$session" ]; then
+    select_session "$session"
+    return
+  fi
+  rex new "$name" -c "$path" --window "$name" -- \
+    env WT_AGENT_CMD="$AGENT_CMD" "$SELF" _resume "$name" "$path" >/dev/null \
+    || die "rex new failed"
+  echo "wt: reopened session $name ($path)"
+}
+
+# Runs as a reopened session's first pane.
+resume() {
+  local name=$1 path=$2
+  record_session "$name"
+  rename_my_tab "$name"
+  # --continue picks up the last conversation in this directory, and fails if there is none.
+  queue_agent "${AGENT_CMD:-claude --continue --remote-control $name || claude --remote-control $name}"
+  cd "$path"
+  exec "${SHELL:-/bin/zsh}" -l
+}
+
+# drop_branch=1 deletes the branch even if unmerged, for callers that checked its commits
+# are on a remote; force=1 also discards uncommitted changes.
+remove() {
+  local name=$1 force=$2 drop_branch=${3:-0}
+  check_name "$name"
+  local repo branch path session
+  repo=$(repo_root)
+  path=$(worktree_path "$repo" "$name")
+  is_worktree "$repo" "$path" || die "no worktree at $path"
+  branch=$(git -C "$path" branch --show-current)
+  session=$(session_id_for "$name")
+
+  local rm_args=()
+  [ "$force" = 1 ] && rm_args+=(--force)
+  git -C "$repo" worktree remove "${rm_args[@]}" "$path" \
+    || die "git worktree remove failed (uncommitted changes? use --force)"
+
+  # -d only deletes merged branches; a squash-merged branch needs --force (-D).
+  local delete_flag=-d
+  [ "$force" = 1 ] || [ "$drop_branch" = 1 ] && delete_flag=-D
+  if [ -z "$branch" ]; then
+    echo "wt: removed $path (it had a detached HEAD, so no branch to delete)"
+  elif git -C "$repo" branch "$delete_flag" "$branch" >/dev/null 2>&1; then
+    echo "wt: removed $path and branch $branch"
+  else
+    echo "wt: removed $path; kept branch $branch (not merged; 'wt rm $name --force' or git branch -D)"
+  fi
+  # The branch wt created, if the worktree moved to another one. Only when merged (-d), even
+  # with --force, since --force was about the branch the worktree ended on.
+  if [ "$BRANCH_PREFIX$name" != "$branch" ] \
+    && git -C "$repo" branch -d "$BRANCH_PREFIX$name" >/dev/null 2>&1; then
+    echo "wt: also deleted the merged branch $BRANCH_PREFIX$name it started on"
+  fi
+  rm -f "$STATE_DIR/$name".{session,prompt}
+
+  # Last, since it may be the session this runs in. After the worktree, so a refused
+  # removal leaves the session (and the agent) alone.
+  if [ -n "$session" ]; then
+    rex kill "$session" >/dev/null || echo "wt: couldn't close session $name"
+  fi
+}
+
+# A two-field form: Tab switches fields, Enter submits from either, pasted newlines are
+# kept. A hand-rolled editor because read -e has one field and submits on any newline.
+prompt() {
+  local repo
+  repo=$(repo_root)
+  local name="" text="" field=name err="" c seq out
+  local bold=$'\e[1m' dim=$'\e[2m' red=$'\e[31m' off=$'\e[0m'
+  local base
+  base=$(default_base "$repo")
+  printf '\e[?2004h'
+  trap 'printf "\e[?2004l"' EXIT
+
+  render() {
+    local n_label="  name" p_label="  prompt"
+    if [ "$field" = name ]; then n_label="${bold}> name${off}"; else p_label="${bold}> prompt${off}"; fi
+    printf '\e[H\e[J'
+    printf '%s\n\n' "${dim}New worktree session in $(basename "$repo") · branch $BRANCH_PREFIX<name> from $base${off}"
+    printf '%s  %s' "$n_label" "$name"
+    [ "$field" = name ] && printf '\e7'
+    printf '\n\n%s  %s\n' "$p_label" "${dim}(optional first message for Claude)${off}"
+    printf '%s' "${text//$'\n'/$'\r\n'}"
+    [ "$field" = prompt ] && printf '\e7'
+    printf '\n\n%s' "${dim}Tab switch field · Enter create · Esc cancel · name may end in --base REF / --no-agent${off}"
+    [ -n "$err" ] && printf '\n%s' "${red}${err}${off}"
+    printf '\e8'
+  }
+
+  append() {
+    if [ "$field" = name ]; then name+=$1; else text+=$1; fi
+  }
+
+  toggle() {
+    if [ "$field" = name ]; then field=prompt; else field=name; fi
+  }
+
+  while true; do
+    render
+    IFS= read -rsn1 -d '' c || exit 0
+    err=""
+    case "$c" in
+      $'\t') toggle ;;
+      $'\n' | $'\r')
+        local -a words
+        read -r -a words <<<"$name"
+        if [ ${#words[@]} -eq 0 ]; then
+          err="name is required"
+          field=name
+          continue
+        fi
+        printf '\e[?2004l\e[H\e[J'
+        if out=$(cd "$repo" && "$SELF" "${words[@]}" --prompt "$text" 2>&1); then
+          exit 0
+        fi
+        err=${out#wt: }
+        printf '\e[?2004h'
+        ;;
+      $'\x7f' | $'\b')
+        if [ "$field" = name ]; then name=${name%?}; else text=${text%?}; fi
+        ;;
+      $'\x15')
+        if [ "$field" = name ]; then name=""; else text=""; fi
+        ;;
+      $'\x17')
+        if [ "$field" = name ]; then
+          [[ "$name" =~ ^(.*[[:space:]])?[^[:space:]]*[[:space:]]*$ ]] && name=${BASH_REMATCH[1]}
+        else
+          [[ "$text" =~ ^(.*[[:space:]])?[^[:space:]]*[[:space:]]*$ ]] && text=${BASH_REMATCH[1]}
+        fi
+        ;;
+      $'\e')
+        seq=""
+        while IFS= read -rsn1 -d '' -t 0.02 c; do
+          seq+=$c
+          [[ "$c" =~ [A-Za-z~] ]] && break
+        done
+        case "$seq" in
+          "") exit 0 ;;
+          "[200~")
+            local paste=""
+            while IFS= read -rsn1 -d '' c; do
+              paste+=$c
+              [[ "$paste" == *$'\e[201~' ]] && break
+            done
+            paste=${paste%$'\e[201~'}
+            paste=${paste//$'\r\n'/$'\n'}
+            paste=${paste//$'\r'/$'\n'}
+            [ "$field" = name ] && paste=${paste//$'\n'/ }
+            append "$paste"
+            ;;
+          "[Z") toggle ;;
+        esac
+        ;;
+      [[:cntrl:]]) ;;
+      *) append "$c" ;;
+    esac
+  done
+}
+
+# Coder workspaces are reached as <name>.coder (or coder.<name>) through `coder ssh`.
+coder_workspace() {
+  case "$1" in
+    *.coder) echo "${1%.coder}" ;;
+    coder.*) echo "${1#coder.}" ;;
+    *) return 1 ;;
+  esac
+}
+
+coder_status() {
+  coder list -o json 2>/dev/null | jq -r --arg n "$1" '.[] | select(.name == $n) | .latest_build.status'
+}
+
+# Starts the workspace if it's stopped and waits until ssh reaches it. Autostop or a
+# finished day stops it, and ssh to a stopped workspace just hangs.
+coder_up() {
+  local ws=$1 dest=$2 st said="" started=0 i
+  for i in $(seq 1 120); do
+    st=$(coder_status "$ws")
+    case "$st" in
+      running)
+        ssh -q -o ConnectTimeout=20 "$dest" true 2>/dev/null && return 0
+        ;;
+      stopped | failed | canceled)
+        [ "$started" = 0 ] || die "$ws is $st after starting it; check it with: coder show $ws"
+        started=1
+        echo "wt: starting $ws, which takes a few minutes" >&2
+        coder start --yes "$ws" >/dev/null 2>&1 || true
+        continue
+        ;;
+      "") die "no Coder workspace named $ws (is coder logged in?)" ;;
+    esac
+    [ "$st" = "$said" ] || echo "wt: waiting for $ws ($st)" >&2
+    said=$st
+    sleep 5
+  done
+  die "$ws didn't come up within 10 minutes"
+}
+
+remote_create() {
+  local dest=$1 remote_cmd=$2 ws
+  shift 2
+  if ws=$(coder_workspace "$dest"); then
+    coder_up "$ws" "$dest" || return 1
+  fi
+  ssh -q "$dest" "$remote_cmd $(printf '%q ' "$@")"
+}
+
+notify() {
+  osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+    -e 'end run' "$1" "$2" >/dev/null 2>&1 || true
+}
+
+# Run detached by Rex's ctrl+b w when the workspace was stopped: Rex actions have 30
+# seconds, and starting a workspace takes minutes. Reports by notification.
+remote_create_bg() {
+  local dest=$1 name=$3 log
+  mkdir -p "$STATE_DIR"
+  log=$STATE_DIR/$name.remote.log
+  if remote_create "$@" >"$log" 2>&1; then
+    notify "wt: $name is ready" "Session created on $dest; switch to that host to see it."
+  else
+    notify "wt: couldn't create $name" "$(grep -v '^\s*$' "$log" | tail -n 1 | sed 's/^wt: //') (log: $log)"
+  fi
+}
+
+# Runs in the floating editor pane that Rex's ctrl+b w opens for a long first message:
+# edit, then create. Save and quit sends the message; an empty file creates the session
+# without one; quitting with an error (:cq! in Helix) cancels. With a destination, the
+# session is created on that ssh host by running "$remote_cmd <args>" there.
+compose() {
+  local dest=$1 remote_cmd=$2
+  shift 2
+  [ $# -ge 1 ] || usage
+  mkdir -p "$STATE_DIR"
+  # A message kept from a failed attempt with this name opens again.
+  local file="$STATE_DIR/$1.first-message.md" text
+  touch "$file"
+  # The pane starts from the login environment, without the EDITOR that zshrc sets.
+  local editor=${VISUAL:-${EDITOR:-}}
+  [ -n "$editor" ] || editor=$(command -v hx || echo /opt/homebrew/bin/hx)
+  # Rex opens this pane focused, but the command palette that asked the questions then
+  # closes and hands focus back to the pane it was opened from. Helix has no option to
+  # start in insert mode, so press i once it's up.
+  (
+    sleep 0.3
+    rex focus -s "$REX_SESSION" "$REX_BLOCK" >/dev/null 2>&1
+    [ "$(basename "$editor")" = hx ] && rex send -s "$REX_SESSION" -b "$REX_BLOCK" i >/dev/null 2>&1
+  ) &
+  if ! "$editor" "$file"; then
+    rm -f "$file"
+    exit 0
+  fi
+  text=$(<"$file")
+  local -a args=("$@")
+  [[ "$text" =~ [^[:space:]] ]] && args+=(--prompt "$text")
+  clear
+  # Errors print as they happen, and so does coder_up's progress while a workspace starts.
+  if [ -z "$dest" ]; then
+    "$SELF" "${args[@]}" >/dev/null && { rm -f "$file"; exit 0; }
+  else
+    remote_create "$dest" "$remote_cmd" "${args[@]}" >/dev/null && { rm -f "$file"; exit 0; }
+  fi
+  echo
+  echo "Your message is kept and opens again if you retry with the same name."
+  wait_key
+}
+
+wait_key() {
+  echo
+  read -rsn1 -p "Press any key to close." || true
+}
+
+pick() {
+  command -v fzf >/dev/null || die "fzf not found"
+  local repo root rows="" wt_path branch name mark
+  repo=$(repo_root)
+  root=$(dirname "$(worktree_path "$repo" x)")
+  while IFS=$'\t' read -r wt_path branch; do
+    name=$(basename "$wt_path")
+    mark="  "
+    [ -n "$(session_id_for "$name")" ] && mark="● "
+    rows+="$mark$name  "$'\e[2m'"${branch:-detached}"$'\e[0m\t'"$wt_path"$'\n'
+  done < <(list_worktrees "$repo")
+  if [ -z "$rows" ]; then
+    echo "No worktrees in $root."
+    wait_key
+    exit 0
+  fi
+  local choice
+  choice=$(printf '%s' "$rows" | fzf --ansi --delimiter=$'\t' --with-nth=1 --no-sort --reverse \
+    --prompt="open worktree> " --header="● has a session · Enter open · Esc cancel" --header-border=bottom) || exit 0
+  name=$(basename "${choice#*$'\t'}")
+  if ! (cd "$repo" && "$SELF" open "$name"); then
+    wait_key
+  fi
+}
+
+# Runs in a floating pane in the worktree to remove.
+rm_here() {
+  local bold=$'\e[1m' dim=$'\e[2m' red=$'\e[31m' off=$'\e[0m'
+  local top branch name repo root
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "Not in a git worktree."; wait_key; exit 0; }
+  repo=$(repo_root)
+  root=$(dirname "$(worktree_path "$repo" x)")
+  if [ "$(dirname "$top")" != "$root" ]; then
+    echo "$top isn't a wt worktree (those live in $root)."
+    wait_key
+    exit 0
+  fi
+  name=$(basename "$top")
+  branch=$(git branch --show-current)
+
+  local dirty unpushed upstream
+  dirty=$(git status --short)
+  if upstream=$(git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null); then
+    unpushed=$(git log --oneline "$upstream..HEAD")
+  else
+    upstream="origin (never pushed)"
+    unpushed=$(git log --oneline "$(default_base "$repo")..HEAD" 2>/dev/null || true)
+  fi
+
+  printf '%s\n%s\n\n' "${bold}Remove worktree $name?${off}" "${dim}$top · ${branch:-detached HEAD}${off}"
+  if [ -n "$dirty" ]; then
+    printf '%s\n' "${red}Uncommitted changes:${off}"
+    head -n 8 <<<"$dirty"
+    [ "$(wc -l <<<"$dirty")" -le 8 ] || echo "  …"
+    echo
+  fi
+  if [ -n "$unpushed" ]; then
+    printf '%s\n' "${red}Commits not on $upstream:${off}"
+    head -n 8 <<<"$unpushed"
+    [ "$(wc -l <<<"$unpushed")" -le 8 ] || echo "  …"
+    echo
+  fi
+  [ -n "$dirty$unpushed" ] || printf '%s\n\n' "Clean, and everything is pushed."
+  printf '%s\n' "y  remove the worktree and session (keeps the branch unless it's merged)"
+  printf '%s\n' "f  force: also discard changes and delete the branch"
+  printf '%s'   "${dim}any other key cancels${off} "
+
+  local key
+  read -rsn1 key || exit 0
+  echo
+  case "$key" in
+    y) "$SELF" rm "$name" || wait_key ;;
+    f) "$SELF" rm "$name" --force || wait_key ;;
+  esac
+}
+
+# Squash merges leave a branch's commits on no remote, so a branch also counts as safe when
+# its PR merged and HEAD is that PR's last commit or an ancestor of it. Prints the PR number.
+merged_pr() {
+  local wt_path=$1 branch=$2 pr
+  [ -n "$branch" ] && command -v gh >/dev/null || return 1
+  pr=$(cd "$wt_path" && gh pr list --head "$branch" --state merged --limit 1 \
+    --json number,headRefOid --jq '.[0] | "\(.number) \(.headRefOid)"' 2>/dev/null) || return 1
+  [ -n "$pr" ] || return 1
+  git -C "$wt_path" merge-base --is-ancestor HEAD "${pr#* }" 2>/dev/null || return 1
+  echo "${pr%% *}"
+}
+
+prune() {
+  local yes=$1 pause=$2
+  local bold=$'\e[1m' dim=$'\e[2m' off=$'\e[0m'
+  local repo root wt_path branch name reason why n merged
+  repo=$(repo_root)
+  root=$(dirname "$(worktree_path "$repo" x)")
+  # Forget worktrees whose directories were deleted by hand.
+  git -C "$repo" worktree prune
+  local -a unused=() kept=()
+  echo "${dim}Checking worktrees in $root…${off}"
+  while IFS=$'\t' read -r wt_path branch; do
+    name=$(basename "$wt_path")
+    reason="" why="${branch:-detached}"
+    if [ -n "$(session_id_for "$name")" ]; then
+      reason="open session"
+    elif n=$(git -C "$wt_path" status --porcelain | wc -l | tr -d ' ') && [ "$n" -gt 0 ]; then
+      reason="$n uncommitted change(s)"
+    elif n=$(git -C "$wt_path" rev-list --count HEAD --not --remotes) && [ "$n" -gt 0 ]; then
+      if merged=$(merged_pr "$wt_path" "$branch"); then
+        why="$branch · PR #$merged merged"
+      else
+        reason="$n commit(s) not on any remote or in a merged PR"
+      fi
+    fi
+    if [ -n "$reason" ]; then
+      kept+=("$(printf '  %-28s %s' "$name" "${dim}${reason}${off}")")
+    else
+      unused+=("$name"$'\t'"$why")
+    fi
+  done < <(list_worktrees "$repo")
+
+  printf '\e[1A\e[2K'
+  if [ ${#kept[@]} -gt 0 ]; then
+    echo "${bold}Keeping${off}"
+    printf '%s\n' "${kept[@]}"
+    echo
+  fi
+  if [ ${#unused[@]} -eq 0 ]; then
+    echo "No unused worktrees."
+    [ "$pause" = 1 ] && wait_key
+    return 0
+  fi
+  echo "${bold}Unused${off} ${dim}(no session, nothing uncommitted, every commit on a remote or in a merged PR)${off}"
+  local row
+  for row in "${unused[@]}"; do
+    printf '  %-28s %s\n' "${row%%$'\t'*}" "${dim}${row#*$'\t'}${off}"
+  done
+  echo
+  if [ "$yes" != 1 ]; then
+    local answer
+    read -r -n1 -p "Remove these ${#unused[@]} worktrees and their local branches? [y/N] " answer || answer=""
+    echo
+    if [ "$answer" != y ] && [ "$answer" != Y ]; then
+      echo "Nothing removed."
+      [ "$pause" = 1 ] && wait_key
+      return 0
+    fi
+  fi
+  local failed=0
+  for row in "${unused[@]}"; do
+    (remove "${row%%$'\t'*}" 0 1) || failed=1
+  done
+  [ "$pause" = 1 ] && wait_key
+  return "$failed"
+}
+
+main() {
+  [ $# -ge 1 ] || usage
+  case "$1" in
+    _bootstrap)
+      shift
+      [ $# -eq 6 ] || usage
+      bootstrap "$@"
+      ;;
+    _setup)
+      shift
+      [ $# -eq 4 ] || usage
+      run_setup "$@"
+      ;;
+    _resume)
+      shift
+      [ $# -eq 2 ] || usage
+      resume "$@"
+      ;;
+    _coder_up)
+      [ $# -eq 3 ] || usage
+      coder_up "$2" "$3"
+      ;;
+    _remote_create_bg)
+      shift
+      [ $# -ge 3 ] || usage
+      remote_create_bg "$@"
+      ;;
+    _compose)
+      shift
+      [ $# -ge 3 ] || usage
+      compose "$@"
+      ;;
+    prompt) prompt ;;
+    pick) pick ;;
+    prune)
+      shift
+      local yes=0 pause=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --yes) yes=1 ;;
+          --pause) pause=1 ;;
+          *) usage ;;
+        esac
+        shift
+      done
+      prune "$yes" "$pause"
+      ;;
+    rm-here) rm_here ;;
+    open)
+      [ $# -eq 2 ] || usage
+      open_worktree "$2"
+      ;;
+    rm)
+      shift
+      local name="" force=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --force) force=1 ;;
+          -*) usage ;;
+          *) [ -z "$name" ] || usage; name=$1 ;;
+        esac
+        shift
+      done
+      [ -n "$name" ] || usage
+      remove "$name" "$force"
+      ;;
+    -*) usage ;;
+    *)
+      local name=$1 base="" start_agent=1 first_prompt=""
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --base) [ $# -ge 2 ] || usage; base=$2; shift ;;
+          --prompt) [ $# -ge 2 ] || usage; first_prompt=$2; shift ;;
+          --no-agent) start_agent=0 ;;
+          *) usage ;;
+        esac
+        shift
+      done
+      create "$name" "$base" "$start_agent" "$first_prompt"
+      ;;
+  esac
+}
+
+main "$@"

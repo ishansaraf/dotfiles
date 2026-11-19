@@ -208,6 +208,8 @@ link_dotfiles() {
   link "$DOTFILES/herdr/config.toml" "$HOME/.config/herdr/config.toml"
   link "$DOTFILES/bin/wt" "$HOME/.local/bin/wt"
   link "$DOTFILES/bin/hunk-pane" "$HOME/.local/bin/hunk-pane"
+  # The Rex version of wt, run over ssh by the laptop's Rex ctrl+b w (see rex/init.lua).
+  link "$DOTFILES/rex/wt" "$HOME/.local/bin/wt-rex"
   link "$DOTFILES/claude/skills/hunk" "$HOME/.claude/skills/hunk"
   link "$DOTFILES/claude/skills/hunk-review" "$HOME/.claude/skills/hunk-review"
   link "$DOTFILES/wt/init" "$HOME/.config/wt/init"
