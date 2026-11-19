@@ -207,6 +207,9 @@ link_dotfiles() {
   link "$DOTFILES/personalize" "$HOME/personalize"
   link "$DOTFILES/herdr/config.toml" "$HOME/.config/herdr/config.toml"
   link "$DOTFILES/bin/wt" "$HOME/.local/bin/wt"
+  link "$DOTFILES/bin/hunk-pane" "$HOME/.local/bin/hunk-pane"
+  link "$DOTFILES/claude/skills/hunk" "$HOME/.claude/skills/hunk"
+  link "$DOTFILES/claude/skills/hunk-review" "$HOME/.claude/skills/hunk-review"
   link "$DOTFILES/wt/init" "$HOME/.config/wt/init"
   # Ubuntu ships these under different names to avoid package conflicts.
   link /usr/bin/fdfind "$HOME/.local/bin/fd"

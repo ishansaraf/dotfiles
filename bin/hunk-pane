@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Opens Hunk in a Rex split beside the calling pane and prints the Hunk session
+# that split created, so the agent in the calling pane attaches to that review
+# and not to another live session in the same repo.
+set -euo pipefail
+
+die() { echo "hunk-pane: $*" >&2; exit 1; }
+
+[[ -n "${REX_SESSION:-}" && -n "${REX_BLOCK:-}" ]] || die "not running inside a Rex pane (REX_SESSION/REX_BLOCK unset)"
+hunk_bin=$(command -v hunk) || die "hunk is not on PATH"
+command -v rex >/dev/null || die "rex is not on PATH"
+command -v jq >/dev/null || die "jq is not on PATH"
+
+root=$(git rev-parse --show-toplevel 2>/dev/null) || root=$PWD
+
+# No arguments reviews the working tree, live. A first argument that is a Hunk
+# subcommand passes through as is; anything else is a target for `hunk diff`.
+if (($# == 0)); then
+  args=(diff --watch)
+else
+  case "$1" in
+    diff | show | log | gh | patch | stash | status | open) args=("$@") ;;
+    *) args=(diff "$@") ;;
+  esac
+fi
+
+# rex runs the program without a shell, so pass hunk's absolute path rather than
+# relying on the pane's login environment to put it on PATH.
+split_json=$(rex split --json -s "$REX_SESSION" -b "$REX_BLOCK" --split right \
+  --label hunk -c "$root" -- "$hunk_bin" "${args[@]}")
+block=$(jq -r --arg caller "$REX_BLOCK" \
+  '[.. | strings | select(startswith("block:") and . != $caller)] | unique | if length == 1 then .[0] else empty end' \
+  <<<"$split_json")
+[[ -n "$block" ]] || die "could not read the new pane from rex: $split_json"
+
+# Hunk records the pid of its window, and Rex reports the pid in the pane's
+# foreground, so matching the two finds this pane's session even when other
+# Hunk windows are open on the same repo.
+session=""
+for _ in $(seq 1 40); do
+  pid=$(rex block call -s "$REX_SESSION" -b "$block" process 2>/dev/null | jq -r '.foreground.pid // empty' || true)
+  if [[ -n "$pid" ]]; then
+    session=$("$hunk_bin" session list --json 2>/dev/null |
+      jq -r --argjson pid "$pid" '.sessions[]? | select(.pid == $pid) | .sessionId' || true)
+    [[ -n "$session" ]] && break
+  fi
+  sleep 0.25
+done
+
+echo "Hunk command: hunk ${args[*]}"
+echo "Repository: $root"
+echo "Rex pane: $block"
+if [[ -n "$session" ]]; then
+  echo "Hunk session: $session"
+else
+  echo "Hunk session: not registered yet; find it with: hunk session list --json (match pid of the Rex pane's foreground)"
+fi
