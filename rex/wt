@@ -7,6 +7,7 @@
 #   wt prompt                form for the name and an optional first prompt (Rex ctrl+b w)
 #   wt pick                  pick a worktree to open (Rex ctrl+b o)
 #   wt rm-here               confirm, then remove the worktree you're in (Rex ctrl+b x)
+#   wt schedule-prune [REPO] run `wt prune --yes` daily (launchd on macOS, systemd on Linux)
 #   wt prune [--yes]         remove every worktree with no open session, no uncommitted
 #                            changes and no commits missing from both the remotes and its
 #                            merged PR (Rex ctrl+b p)
@@ -479,6 +480,24 @@ remote_create_bg() {
   fi
 }
 
+# The user's Helix config plus soft wrap, so a long message wraps on screen at the 100-column
+# ruler (or the pane's edge) without newlines being added to it. Left as is when the user's
+# config already sets soft-wrap or text-width, since TOML can't set a key twice.
+helix_prose_config() {
+  local src=${XDG_CONFIG_HOME:-$HOME/.config}/helix/config.toml out=$STATE_DIR/compose-helix.toml
+  local wrap='soft-wrap = { enable = true, wrap-at-text-width = true, wrap-indicator = "" }'
+  if [ ! -f "$src" ]; then
+    printf '[editor]\ntext-width = 100\n%s\n' "$wrap" >"$out"
+  elif grep -qE 'soft-wrap|text-width' "$src"; then
+    out=$src
+  elif grep -qx '\[editor\]' "$src"; then
+    awk -v wrap="$wrap" '{ print } $0 == "[editor]" { print "text-width = 100"; print wrap }' "$src" >"$out"
+  else
+    { printf '[editor]\ntext-width = 100\n%s\n\n' "$wrap"; cat "$src"; } >"$out"
+  fi
+  echo "$out"
+}
+
 # Runs in the floating editor pane that Rex's ctrl+b w opens for a long first message:
 # edit, then create. Save and quit sends the message; an empty file creates the session
 # without one; quitting with an error (:cq! in Helix) cancels. With a destination, the
@@ -502,7 +521,9 @@ compose() {
     rex focus -s "$REX_SESSION" "$REX_BLOCK" >/dev/null 2>&1
     [ "$(basename "$editor")" = hx ] && rex send -s "$REX_SESSION" -b "$REX_BLOCK" i >/dev/null 2>&1
   ) &
-  if ! "$editor" "$file"; then
+  local -a editor_args=()
+  [ "$(basename "$editor")" = hx ] && editor_args=(--config "$(helix_prose_config)")
+  if ! "$editor" "${editor_args[@]}" "$file"; then
     rm -f "$file"
     exit 0
   fi
@@ -519,6 +540,84 @@ compose() {
   echo
   echo "Your message is kept and opens again if you retry with the same name."
   wait_key
+}
+
+# Installs a daily `wt prune --yes` of REPO (default WT_DEFAULT_REPO) for this machine: a launchd agent on macOS, a systemd
+# user timer on Linux. Runs at 04:00, or at the next wake or start when the machine was
+# asleep or stopped then. The job keeps this PATH and WT_DEFAULT_REPO.
+PRUNE_JOB=wt-prune
+schedule_prune() {
+  local log=$STATE_DIR/prune.log repo=${1:-$DEFAULT_REPO}
+  [ -d "$repo/.git" ] || die "$repo isn't a git checkout"
+  repo=$(cd "$repo" && pwd)
+  mkdir -p "$STATE_DIR"
+  case "$(uname)" in
+    Darwin)
+      local label=com.dotfiles.$PRUNE_JOB plist=$HOME/Library/LaunchAgents/com.dotfiles.$PRUNE_JOB.plist
+      mkdir -p "$(dirname "$plist")"
+      cat >"$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array><string>$(xml_escape "$SELF")</string><string>_scheduled_prune</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$(xml_escape "$PATH")</string>
+    <key>WT_DEFAULT_REPO</key><string>$(xml_escape "$repo")</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>$(xml_escape "$log")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$log")</string>
+</dict>
+</plist>
+EOF
+      launchctl bootout "gui/$UID/$label" 2>/dev/null || true
+      launchctl bootstrap "gui/$UID" "$plist" || die "launchctl bootstrap failed"
+      echo "wt: pruning $repo daily at 04:00 (launchd $label); log: $log"
+      echo "    run it now with: launchctl kickstart gui/$UID/$label"
+      ;;
+    Linux)
+      local dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+      mkdir -p "$dir"
+      cat >"$dir/$PRUNE_JOB.service" <<EOF
+[Unit]
+Description=Remove unused wt worktrees of $repo
+
+[Service]
+Type=oneshot
+Environment="PATH=$PATH" "WT_DEFAULT_REPO=$repo"
+ExecStart="$SELF" _scheduled_prune
+StandardOutput=append:$log
+StandardError=append:$log
+EOF
+      cat >"$dir/$PRUNE_JOB.timer" <<EOF
+[Unit]
+Description=Daily wt prune
+
+[Timer]
+OnCalendar=*-*-* 04:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now "$PRUNE_JOB.timer" >/dev/null || die "couldn't enable $PRUNE_JOB.timer"
+      echo "wt: pruning $repo daily at 04:00 (systemd user timer $PRUNE_JOB); log: $log"
+      echo "    run it now with: systemctl --user start $PRUNE_JOB.service"
+      ;;
+    *) die "don't know how to schedule on $(uname)" ;;
+  esac
+}
+
+xml_escape() {
+  local s=${1//&/&amp;}
+  s=${s//</&lt;}
+  printf '%s' "${s//>/&gt;}"
 }
 
 wait_key() {
@@ -617,7 +716,11 @@ merged_pr() {
 prune() {
   local yes=$1 pause=$2
   local bold=$'\e[1m' dim=$'\e[2m' off=$'\e[0m'
+  [ -t 1 ] || bold="" dim="" off=""
   local repo root wt_path branch name reason why n merged
+  # A worktree's session is looked up per worktree, where a failed lookup reads as "no
+  # session"; without a server, every worktree would look unused.
+  rex ls --json >/dev/null || die "can't reach the Rex server to check for open sessions"
   repo=$(repo_root)
   root=$(dirname "$(worktree_path "$repo" x)")
   # Forget worktrees whose directories were deleted by hand.
@@ -645,7 +748,7 @@ prune() {
     fi
   done < <(list_worktrees "$repo")
 
-  printf '\e[1A\e[2K'
+  [ -t 1 ] && printf '\e[1A\e[2K'
   if [ ${#kept[@]} -gt 0 ]; then
     echo "${bold}Keeping${off}"
     printf '%s\n' "${kept[@]}"
@@ -714,6 +817,14 @@ main() {
       ;;
     prompt) prompt ;;
     pick) pick ;;
+    schedule-prune)
+      [ $# -le 2 ] || usage
+      schedule_prune "${2:-}"
+      ;;
+    _scheduled_prune)
+      printf '\n== %s\n' "$(date)"
+      prune 1 0
+      ;;
     prune)
       shift
       local yes=0 pause=0
