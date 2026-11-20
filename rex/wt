@@ -544,7 +544,8 @@ compose() {
 
 # Installs a daily `wt prune --yes` of REPO (default WT_DEFAULT_REPO) for this machine: a launchd agent on macOS, a systemd
 # user timer on Linux. Runs at 04:00, or at the next wake or start when the machine was
-# asleep or stopped then. The job keeps this PATH and WT_DEFAULT_REPO.
+# asleep or stopped then. The job keeps this PATH and WT_DEFAULT_REPO. On Linux, set
+# WT_PRUNE_TZ (e.g. America/New_York) to run at 04:00 there rather than the box's clock.
 PRUNE_JOB=wt-prune
 schedule_prune() {
   local log=$STATE_DIR/prune.log repo=${1:-$DEFAULT_REPO}
@@ -599,7 +600,7 @@ EOF
 Description=Daily wt prune
 
 [Timer]
-OnCalendar=*-*-* 04:00
+OnCalendar=*-*-* 04:00${WT_PRUNE_TZ:+ $WT_PRUNE_TZ}
 Persistent=true
 
 [Install]
